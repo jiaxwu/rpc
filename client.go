@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Call 代表一次RPC调度
@@ -104,7 +106,7 @@ func (c *Client) receive() {
 		}
 		call := c.removeCall(h.Seq)
 		switch {
-		// call已经被移除了
+		// call已经被移除了，比如超时
 		case call == nil:
 			err = c.cc.ReadBody(nil)
 		// 请求出错
@@ -153,18 +155,51 @@ func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	return client
 }
 
+type clientResult struct {
+	client *Client
+	err    error
+}
+
 // Dial 连接RPC服务器
 func Dial(network, address string, opt *Option) (c *Client, err error) {
-	conn, err := net.Dial(network, address)
+	if opt == nil {
+		opt = DefaultOption
+	} else {
+		opt.MagicNumber = MagicNumber
+		if opt.CodecType == "" {
+			opt.CodecType = DefaultOption.CodecType
+		}
+	}
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if c == nil {
+		if err != nil {
 			_ = conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+	// NewClient超时处理
+	ch := make(chan clientResult)
+	go func() {
+		client, err := NewClient(conn, opt)
+		ch <- clientResult{
+			client: client,
+			err:    err,
+		}
+	}()
+	// 如果超时时间为0，表示可以一直等待
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	// 否则等待直到超时
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+	}
 }
 
 func (c *Client) send(call *Call) {
@@ -211,7 +246,13 @@ func (c *Client) Go(serviceMethod string, args, reply any, done chan *Call) *Cal
 }
 
 // Call 同步调用
-func (c *Client) Call(serviceMethod string, args, reply any) error {
-	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (c *Client) Call(ctx context.Context, serviceMethod string, args, reply any) error {
+	call := c.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		c.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
 }
