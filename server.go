@@ -8,9 +8,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 )
 
@@ -236,4 +238,87 @@ func (s *Server) findService(serviceMethod string) (*service, *methodType, error
 		return nil, nil, errors.New("rpc server: can't find method " + methodName)
 	}
 	return svc, mType, nil
+}
+
+const (
+	connected        = "200 Connected to RPC"
+	defaultRPCPath   = "/_rpc_"
+	defaultDebugPath = "/debug/rpc"
+)
+
+// ServeHTTP 通过HTTP去处理RPC请求
+// 使用HTTP好处：一个TCP端口通过不同HTTP路径去支持不同服务
+// HTTP这里做的是协议的协商工作，去建立一个长连接
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodConnect {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc server hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	s.ServeConn(conn)
+}
+
+func (s *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, s)
+	http.Handle(defaultDebugPath, debugHTTP{s})
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}
+
+const debugText = `<html>
+	<body>
+	<title>GeeRPC Services</title>
+	{{range .}}
+	<hr>
+	Service {{.Name}}
+	<hr>
+		<table>
+		<th align=center>Method</th><th align=center>Calls</th>
+		{{range $name, $mtype := .Method}}
+			<tr>
+			<td align=left font=fixed>{{$name}}({{$mtype.ArgType}}, {{$mtype.ReplyType}}) error</td>
+			<td align=center>{{$mtype.NumCalls}}</td>
+			</tr>
+		{{end}}
+		</table>
+	{{end}}
+	</body>
+	</html>`
+
+var debug = template.Must(template.New("RPC debug").Parse(debugText))
+
+type debugHTTP struct {
+	*Server
+}
+
+type debugService struct {
+	Name   string
+	Method map[string]*methodType
+}
+
+// Runs at /debug/geerpc
+func (s debugHTTP) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// Build a sorted version of the data.
+	var services []debugService
+	s.serviceMap.Range(func(namei, svci interface{}) bool {
+		svc := svci.(*service)
+		services = append(services, debugService{
+			Name:   namei.(string),
+			Method: svc.method,
+		})
+		return true
+	})
+	err := debug.Execute(w, services)
+	if err != nil {
+		_, _ = fmt.Fprintln(w, "rpc: error executing template:", err.Error())
+	}
 }
